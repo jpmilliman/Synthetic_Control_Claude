@@ -53,7 +53,7 @@ res <- synth_lasso_boot(
   time_cols        = c("year", "qtr"),
   outcome_col      = "gdpcapita",
   treated_unit     = "Kansas",
-  treatment_period = 90,              # rowid of the first treated period
+  treatment_period = c(year = 2012, qtr = 2),   # first treated period
   seed             = 12112025
 )
 
@@ -72,9 +72,24 @@ res$weights    # donor weights
 | `time_cols` | *required* | Column(s) that order time, e.g. `c("year", "qtr")`. Periods are sorted and numbered 1, 2, …; that number is `rowid` in the output. |
 | `outcome_col` | *required* | Outcome column, e.g. `"gdpcapita"`. Must be numeric with no missing values. |
 | `treated_unit` | *required* | Name of the treated unit, e.g. `"Kansas"`. |
-| `treatment_period` | *required* | `rowid` of the **first post-treatment period**. Pre-treatment = `rowid < treatment_period`. |
+| `treatment_period` | *required* | The **first post-treatment period**, given as the value(s) of `time_cols` in that period, e.g. `c(year = 2013)` or `c(year = 2012, qtr = 2)`. See below. |
 
 The panel must be balanced: every unit needs every period.
+
+#### Specifying the treatment period
+
+`treatment_period` is the first treated period, written in the same terms as your time columns, with one value for each column in `time_cols`:
+
+``` r
+# One time column: the first treated year
+time_cols = "year", treatment_period = c(year = 2013)     # or just 2013
+
+# Several time columns: the first treated year and quarter
+time_cols = c("year", "qtr"), treatment_period = c(year = 2012, qtr = 2)
+                                                         # or c(2012, 2)
+```
+
+Named values are matched to `time_cols` by name; unnamed values are taken in the order of `time_cols`. Each value must match a period in the data exactly (a `list()` can hold other types, such as a `Date`). Every period before it is pre-treatment, and it and every later period are post-treatment, shown by the logical `post` column in the output. At least two pre-treatment periods are required.
 
 ### Control variables
 
@@ -147,6 +162,7 @@ Columns of `effects`:
 | Column | Description |
 |----|----|
 | `rowid`, time columns, `period` | Period number, the original time columns, and a label such as `"2012_2"`. |
+| `post` | `TRUE` from the first treated period on, `FALSE` before it. |
 | `treated_observed` | Observed outcome for the treated unit. |
 | `treated_predicted` | Synthetic control prediction. |
 | `att`, `att_post` | Observed minus predicted, for all periods and for post-treatment only. |
@@ -169,7 +185,7 @@ $$
 B = M \times \max_{t < T_0} \left| Y_t - \hat{Y}_t \right|
 $$
 
-where $T_0$ is `treatment_period`. For each post-treatment period the ATT is then shown with a band of $\pm B$:
+where $T_0$ is the first treated period (`treatment_period`). For each post-treatment period the ATT is then shown with a band of $\pm B$:
 
 - `bounds_lo = att - B`
 - `bounds_hi = att + B`
@@ -206,7 +222,7 @@ With `boot_by_unit = FALSE`, each variable is bootstrapped as one long series ac
 
 ## Example: Kansas GDP per capita
 
-This example uses the **Kansas tax experiment**. In 2012, Kansas passed large income tax cuts, and the example estimates their effect on GDP per capita, using the other 49 states as donors and treating 2012 Q2 (`rowid` 90) as the first treated quarter.
+This example uses the **Kansas tax experiment**. In 2012, Kansas passed large income tax cuts, and the example estimates their effect on GDP per capita, using the other 49 states as donors and treating 2012 Q2 as the first treated quarter (`treatment_period = c(year = 2012, qtr = 2)`). An annual version with a single time column (`time_cols = "year"`, `treatment_period = c(year = 2013)`) is in `Example_cases/Synth_lasso_boot_example.R`.
 
 The data come from the **augsynth** R package, which includes the `kansas` dataset: a quarterly panel of the 50 US states from 1990 Q1 to 2016 Q1.
 
@@ -255,7 +271,7 @@ kansas_m1 <- synth_lasso_boot(
   time_cols        = c("year", "qtr"),
   outcome_col      = "gdpcapita",
   treated_unit     = "Kansas",
-  treatment_period = 90,
+  treatment_period = c(year = 2012, qtr = 2),
   seed             = 12112025,
   M                = 1,
   jack_conform     = TRUE,
@@ -307,7 +323,7 @@ Observed Kansas against the synthetic prediction and its 95% jackknife predictio
 
 ``` r
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   mutate(outside_interval = treated_observed < pred_jack_lo |
                             treated_observed > pred_jack_hi) |>
   select(period, treated_observed, treated_predicted,
@@ -347,7 +363,7 @@ Average width of each interval over the post-treatment quarters:
 
 ``` r
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   summarise(
     `Jackknife prediction interval` = mean(pred_jack_hi - pred_jack_lo),
     `Bootstrap effect interval`     = mean(eff_high - eff_low),
@@ -369,12 +385,12 @@ The ATT with its sensitivity bounds at `M = 1`, and the value of `M` at which ea
 
 ``` r
 max_pre_gap <- kansas_m1$effects |>
-  filter(rowid < 90) |>
+  filter(!post) |>
   summarise(max(abs(att))) |>
   pull()
 
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   mutate(M_breakdown = abs(att) / max_pre_gap) |>
   select(period, att, bounds_lo, bounds_hi, M_breakdown) |>
   knitr::kable(digits = 2)
@@ -405,7 +421,7 @@ Largest absolute pre-treatment gap between observed and predicted: 1568.
 
 ``` r
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   select(period, att, eff_low, eff_high,
          cum_att, cum_eff_low, cum_eff_high) |>
   knitr::kable(digits = 0)
@@ -441,7 +457,7 @@ kansas_m2 <- synth_lasso_boot(
   time_cols        = c("year", "qtr"),
   outcome_col      = "gdpcapita",
   treated_unit     = "Kansas",
-  treatment_period = 90,
+  treatment_period = c(year = 2012, qtr = 2),
   controls         = "popestimate",
   control_units    = "donors",
   scale_controls   = TRUE,
@@ -487,7 +503,7 @@ Post-treatment rows with jackknife intervals, sensitivity bounds and bootstrap i
 
 ``` r
 kansas_m2$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   select(period, treated_observed, treated_predicted, pred_jack_lo, pred_jack_hi,
          att, bounds_lo, bounds_hi, eff_low, eff_high) |>
   knitr::kable(digits = 0)
@@ -585,7 +601,7 @@ ggplot(plot_df, aes(x = period, group = 1)) +
 
 ``` r
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   ggplot(aes(x = period, group = 1)) +
   geom_ribbon(aes(ymin = cum_eff_low, ymax = cum_eff_high), fill = "lightblue", alpha = 0.4) +
   geom_line(aes(y = cum_att), color = "blue") +

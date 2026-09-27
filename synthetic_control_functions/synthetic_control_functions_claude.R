@@ -264,8 +264,17 @@ meboot_multi <- function(data,
 #                     number is the `rowid` column in the output.
 #   outcome_col       outcome column (e.g. "gdpcapita")
 #   treated_unit      name of the treated unit (e.g. "Kansas")
-#   treatment_period  rowid of the FIRST post-treatment period
-#                     (Kansas: 90 = 2012 Q2). Pre = rowid < treatment_period.
+#   treatment_period  the FIRST post-treatment period, given as the value(s)
+#                     of time_cols in that period:
+#                       - one time column:  c(year = 2013), or just 2013
+#                       - several columns:  c(year = 2012, qtr = 2), or
+#                                           unnamed in time_cols order,
+#                                           c(2012, 2)
+#                     Values are matched exactly against the data (a list
+#                     can hold mixed types, e.g. a Date). Every period
+#                     before it is pre-treatment; it and every later period
+#                     are post-treatment. At least 2 pre-treatment periods
+#                     are required.
 #
 # ---- Control variables ------------------------------------------------------
 #   controls          optional character vector of extra numeric columns in
@@ -349,6 +358,7 @@ meboot_multi <- function(data,
 # ---- Value --------------------------------------------------------------------
 # A list:
 #   effects    one row per period: rowid, time columns, period label,
+#              post (TRUE from the first treated period on),
 #              treated_observed, treated_predicted, att, att_post, cum_att,
 #              bounds_lo / bounds_hi, (pred_jack_lo / pred_jack_hi),
 #              eff_low / eff_high / average_eff (bootstrap effect intervals),
@@ -441,10 +451,41 @@ synth_lasso_boot <- function(data,
   data$.rowid <- match(time_key, period_key)
   n_periods <- nrow(periods)
   
-  if (treatment_period < 3 || treatment_period > n_periods) {
-    stop("treatment_period must be between 3 and ", n_periods, ".")
+  ## ---- Locate the first treated period -----------------------------------
+  period_labels <- do.call(paste, c(periods, sep = "_"))
+  tp <- as.list(treatment_period)
+  
+  if (length(tp) != length(time_cols)) {
+    stop("treatment_period needs one value for each time column (",
+         paste(time_cols, collapse = ", "), "), e.g. ",
+         if (length(time_cols) == 1) paste0("c(", time_cols, " = 2013)")
+         else paste0("c(", paste(time_cols, "= ...", collapse = ", "), ")"), ".")
   }
-  pre  <- seq_len(n_periods) < treatment_period
+  tp_names <- names(tp)
+  if (is.null(tp_names) || all(tp_names == "")) {
+    names(tp) <- time_cols
+  } else if (any(tp_names == "") || !setequal(tp_names, time_cols)) {
+    stop("treatment_period names must match time_cols (",
+         paste(time_cols, collapse = ", "), "), or leave them all unnamed.")
+  } else {
+    tp <- tp[time_cols]
+  }
+  
+  is_tp <- Reduce(`&`, lapply(time_cols, function(tc) {
+    as.character(periods[[tc]]) == as.character(tp[[tc]])
+  }))
+  if (!any(is_tp)) {
+    stop("treatment_period (",
+         paste(names(tp), vapply(tp, as.character, character(1)), sep = " = ", collapse = ", "),
+         ") does not match any period in the data. Periods run from ",
+         period_labels[1], " to ", period_labels[n_periods], ".")
+  }
+  treatment_rowid <- which(is_tp)
+  if (treatment_rowid < 3) {
+    stop("At least 2 pre-treatment periods are needed; the first treated period is ",
+         period_labels[treatment_rowid], ".")
+  }
+  pre  <- seq_len(n_periods) < treatment_rowid
   post <- !pre
   
   ## ---- Units and predictor layout ----------------------------------------
@@ -597,7 +638,8 @@ synth_lasso_boot <- function(data,
   att <- y_obs - treated_predicted
   
   effects <- data.frame(rowid = seq_len(n_periods), periods,
-                        period = do.call(paste, c(periods, sep = "_")),
+                        period = period_labels,
+                        post = post,
                         treated_observed = y_obs,
                         treated_predicted = treated_predicted,
                         att = att,
@@ -703,7 +745,9 @@ synth_lasso_boot <- function(data,
   
   effects$treated_unit <- treated_unit
   
-  settings <- list(treated_unit = treated_unit, treatment_period = treatment_period,
+  settings <- list(treated_unit = treated_unit, treatment_period = tp,
+                   treatment_rowid = treatment_rowid,
+                   treatment_label = period_labels[treatment_rowid],
                    controls = controls, control_units = control_units,
                    intercept = intercept,
                    standardize = standardize, scale_controls = scale_controls,

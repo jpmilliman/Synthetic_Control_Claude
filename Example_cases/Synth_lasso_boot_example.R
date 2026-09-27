@@ -36,7 +36,13 @@
 #                     periods are numbered 1, 2, ... = `rowid` in the output
 #   outcome_col       outcome column, e.g. "gdpcapita"
 #   treated_unit      treated unit, e.g. "Kansas"
-#   treatment_period  rowid of the FIRST post-treatment period (Kansas: 90)
+#   treatment_period  the FIRST post-treatment period, as the value(s) of
+#                     time_cols in that period:
+#                       one time column:  c(year = 2013)  (or just 2013)
+#                       several columns:  c(year = 2012, qtr = 2)
+#                                         (or unnamed, c(2012, 2))
+#                     Earlier periods are pre-treatment; it and later
+#                     periods are post-treatment (the `post` column).
 #
 # Control variables
 #   controls          extra numeric columns, e.g. "popestimate"; enter the
@@ -88,7 +94,7 @@
 #   ...               passed to meboot::meboot()
 #
 # Output (a list)
-#   effects    one row per period: rowid, time columns, period,
+#   effects    one row per period: rowid, time columns, period, post,
 #              treated_observed, treated_predicted, att, att_post, cum_att,
 #              bounds_lo, bounds_hi, pred_jack_lo, pred_jack_hi (if
 #              jack_conform), eff_low, eff_high, average_eff, cum_eff_low,
@@ -124,7 +130,8 @@ n_reps <- 1000   # lower for a quick run
 ## ---- Data -------------------------------------------------------------------
 # Kansas tax experiment: in 2012 Kansas passed large income tax cuts. The
 # `kansas` dataset in the augsynth package is a quarterly panel of the 50
-# US states from 1990 Q1 to 2016 Q1. Treatment starts in 2012 Q2 (rowid 90).
+# US states from 1990 Q1 to 2016 Q1. Treatment starts in 2012 Q2, so the
+# first treated period is year = 2012, qtr = 2.
 data("kansas")
 
 kansas |>
@@ -142,7 +149,7 @@ kansas_m1 <- synth_lasso_boot(
   time_cols        = c("year", "qtr"),
   outcome_col      = "gdpcapita",
   treated_unit     = "Kansas",
-  treatment_period = 90,
+  treatment_period = c(year = 2012, qtr = 2),
   seed             = 12112025,
   M                = 1,
   jack_conform     = TRUE,
@@ -161,7 +168,7 @@ kansas_m1$weights
 # prediction interval. outside_interval = TRUE when observed Kansas falls
 # outside the interval.
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   mutate(outside_interval = treated_observed < pred_jack_lo |
                             treated_observed > pred_jack_hi) |>
   select(period, treated_observed, treated_predicted,
@@ -183,7 +190,7 @@ kansas_m1$effects |>
 
 # Average width of each interval over the post-treatment quarters
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   summarise(
     jackknife_prediction_interval = mean(pred_jack_hi - pred_jack_lo),
     bootstrap_effect_interval     = mean(eff_high - eff_low),
@@ -194,7 +201,7 @@ kansas_m1$effects |>
 ## ---- Sensitivity bounds -------------------------------------------------------
 # Largest absolute pre-treatment gap between observed and predicted
 max_pre_gap <- kansas_m1$effects |>
-  filter(rowid < 90) |>
+  filter(!post) |>
   summarise(max(abs(att))) |>
   pull()
 
@@ -202,14 +209,14 @@ max_pre_gap
 
 # ATT with its bounds at M = 1, and the M at which each band includes zero
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   mutate(M_breakdown = abs(att) / max_pre_gap) |>
   select(period, att, bounds_lo, bounds_hi, M_breakdown)
 
 
 ## ---- Bootstrap effect and cumulative-effect intervals ------------------------
 kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   select(period, att, eff_low, eff_high,
          cum_att, cum_eff_low, cum_eff_high)
 
@@ -227,7 +234,7 @@ kansas_m2 <- synth_lasso_boot(
   time_cols        = c("year", "qtr"),
   outcome_col      = "gdpcapita",
   treated_unit     = "Kansas",
-  treatment_period = 90,
+  treatment_period = c(year = 2012, qtr = 2),
   controls         = "popestimate",
   control_units    = "donors",
   scale_controls   = TRUE,
@@ -257,9 +264,44 @@ kansas_m2$settings$predictors |>
 # Post-treatment rows: jackknife intervals (far too small here, as in
 # Model 1), sensitivity bounds and bootstrap intervals
 kansas_m2$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   select(period, treated_observed, treated_predicted, pred_jack_lo, pred_jack_hi,
          att, bounds_lo, bounds_hi, eff_low, eff_high)
+
+
+##############################################################################
+## Model 3: annual data with a single time column
+##############################################################################
+# Many analyses use one time variable, e.g. year. Here the quarterly data are
+# averaged to annual values (2016 is dropped because it only has Q1), so
+# time_cols is just "year" and the treatment period is a single value.
+# 2013, the first full year after the 2012 tax cuts, is the first treated
+# year. treatment_period = 2013 (unnamed) works the same way.
+
+kansas_annual <- kansas |>
+  filter(year <= 2015) |>
+  group_by(state, year) |>
+  summarise(gdpcapita = mean(gdpcapita), .groups = "drop")
+
+kansas_m3 <- synth_lasso_boot(
+  data             = kansas_annual,
+  unit_col         = "state",
+  time_cols        = "year",
+  outcome_col      = "gdpcapita",
+  treated_unit     = "Kansas",
+  treatment_period = c(year = 2013),
+  seed             = 12112025,
+  reps             = n_reps,
+  trim             = list(trim = 0.10, xmin = 15000),
+  conf_int         = 0.95
+)
+
+# First treated period found by the function
+kansas_m3$settings$treatment_label
+
+kansas_m3$effects |>
+  filter(post) |>
+  select(period, att, eff_low, eff_high, cum_att, cum_eff_low, cum_eff_high)
 
 
 ##############################################################################
@@ -324,7 +366,7 @@ plot_effects
 
 ## ---- Cumulative effect with bootstrap intervals ------------------------------
 plot_cumulative <- kansas_m1$effects |>
-  filter(rowid >= 90) |>
+  filter(post) |>
   ggplot(aes(x = period, group = 1)) +
   geom_ribbon(aes(ymin = cum_eff_low, ymax = cum_eff_high), fill = "lightblue", alpha = 0.4) +
   geom_line(aes(y = cum_att), color = "blue") +
