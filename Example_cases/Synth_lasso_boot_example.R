@@ -75,17 +75,27 @@
 #
 # Inference on the observed fit
 #   M                 sensitivity-bound multiplier (default 1)
-#   jack_conform      add jackknife conformal prediction intervals
+#   jack_conform      add jackknife conformal prediction intervals (via
+#                     conformalInference::conformal.pred.jack(); the function works
+#                     around that package's single-prediction-column bug, which
+#                     otherwise uses only the first leave-one-out residual)
 #                     (default FALSE)
 #   conform_level     coverage of the conformal intervals (default 0.95)
 #
 # Bootstrap
 #   boot              run the bootstrap (default TRUE)
 #   reps              number of replicates (default 1000)
-#   trim              meboot trim/xmin/xmax: one list for all variables or a
-#                     list named by variable
+#   trim              bootstrap limits: one list for all variables or a list
+#                     named by variable. Settings: trim, xmin, xmax,
+#                     xmin_rel (fraction of each series' own minimum),
+#                     xmax_rel (multiple of its own maximum). With
+#                     boot_by_unit = TRUE, xmin/xmax can be named by unit,
+#                     e.g. xmin = c(15000, Alaska = 35000)
 #   boot_by_unit      FALSE (default) = one stacked series per variable;
 #                     TRUE = each unit bootstrapped separately
+#   shared_draws      with boot_by_unit = TRUE: same random numbers for every
+#                     unit, so units are nudged up or down together
+#                     (default FALSE)
 #   boot_nlambda      lambda path length for the bootstrap refits
 #                     (default 100)
 #   conf_int          level of the bootstrap intervals (default 0.95)
@@ -187,6 +197,9 @@ kansas_m1$effects |>
 #      although forecast error should grow further past 2012.
 # outside_interval = TRUE is therefore not reliable evidence of an effect
 # here; rely on the bootstrap intervals and sensitivity bounds instead.
+# (These intervals are after the fix for conformal.pred.jack()'s single-column
+# bug; before it they used only the first pre-treatment residual and were
+# narrower still.)
 
 # Average width of each interval over the post-treatment quarters
 kansas_m1$effects |>
@@ -226,7 +239,8 @@ kansas_m1$effects |>
 ##############################################################################
 # Donor-state population is added as a control and rescaled to the donors'
 # scale. Colorado is kept in the model without a penalty, cross-validation
-# chooses the penalty, and each state is bootstrapped separately.
+# chooses the penalty, and each state is bootstrapped separately, with shared
+# draws and lower limits at 90% of each state's own minimum.
 
 kansas_m2 <- synth_lasso_boot(
   data             = kansas,
@@ -246,9 +260,10 @@ kansas_m2 <- synth_lasso_boot(
   M                = 1,
   jack_conform     = TRUE,
   reps             = n_reps,
-  trim             = list(gdpcapita   = list(trim = 0.10, xmin = 15000),
-                          popestimate = list(trim = 0.10, xmin = 450000)),
+  trim             = list(gdpcapita   = list(trim = 0.10, xmin_rel = 0.9),
+                          popestimate = list(trim = 0.10, xmin_rel = 0.9)),
   boot_by_unit     = TRUE,
+  shared_draws     = TRUE,
   conf_int         = 0.95
 )
 

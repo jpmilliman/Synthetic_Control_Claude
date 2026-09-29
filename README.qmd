@@ -186,17 +186,43 @@ cross-validation choose the penalty.
 |---|---|---|
 | `boot` | `TRUE` | Run the bootstrap. `FALSE` returns only the observed fit. |
 | `reps` | `1000` | Number of bootstrap replicates. |
-| `trim` | `list(trim = 0.10, xmin = NULL, xmax = NULL)` | meboot `trim`/`xmin`/`xmax`. One list for every bootstrapped variable, or a list named by variable, e.g. `list(gdpcapita = list(xmin = 15000), popestimate = list(xmin = 450000))`. |
+| `trim` | `list(trim = 0.10, xmin = NULL, xmax = NULL)` | Bootstrap limits: one list for every bootstrapped variable, or a list named by variable. Settings: `trim`, `xmin`, `xmax`, `xmin_rel`, `xmax_rel` (see [Bootstrap limits](#bootstrap-limits)). |
 | `boot_by_unit` | `FALSE` | `FALSE` bootstraps each variable as one stacked series across all units, in the row order of `data`. `TRUE` bootstraps each unit's series separately, so each unit keeps its own time dependence. |
+| `shared_draws` | `FALSE` | With `boot_by_unit = TRUE`: `TRUE` gives every unit the same random numbers (within each variable and replicate), so units are nudged up or down together. `FALSE` draws independently for each unit. Ignored, with a warning, when `boot_by_unit = FALSE`. |
 | `boot_nlambda` | `100` | Lambda path length for the bootstrap refits. |
 | `conf_int` | `0.95` | Level of the bootstrap effect and cumulative-effect intervals. |
 | `boot_seed` | `seed` | Seed for the bootstrap. |
 | `keep_boot` | `FALSE` | `TRUE` also returns the bootstrap replicates (can be large). |
 | `...` | | Further arguments passed to `meboot::meboot()`, e.g. `reachbnd`, `expand.sd`, `force.clt`. |
 
-**Choosing `xmin`.** meboot stretches the lower tail of each series down to
-`xmin`. With `xmin = 0`, some draws can fall far below any observed value.
-Set it to a plausible floor for the variable instead.
+#### Bootstrap limits
+
+meboot stretches the lower tail of each series down to `xmin` and the upper
+tail up to `xmax`, so these limits decide how far the most extreme draws can
+go. Each variable's list in `trim` can contain:
+
+| Setting | Meaning |
+|---|---|
+| `trim` | Trimmed-mean proportion meboot uses for the default tail limits (default `0.10`). |
+| `xmin`, `xmax` | Absolute limits. One number applies to every series. With `boot_by_unit = TRUE`, a vector can hold one unnamed default plus values named by unit, e.g. `xmin = c(15000, Alaska = 35000)`. |
+| `xmin_rel` | Lower limit as a fraction of **each series' own minimum**, e.g. `0.9` = 90% of each unit's lowest value. |
+| `xmax_rel` | Upper limit as a multiple of each series' own maximum, e.g. `1.1`. |
+
+```r
+trim = list(gdpcapita   = list(xmin_rel = 0.9, xmax_rel = 1.1),
+            popestimate = list(xmin = c(450000, California = 29000000)))
+```
+
+Give `xmin` or `xmin_rel` (and `xmax` or `xmax_rel`), not both. Relative
+limits need strictly positive data. A limit inside a series' observed range
+(for example, an `xmin` above its lowest value) stops with an error. Unset
+limits use meboot's defaults.
+
+With `boot_by_unit = TRUE`, a single `xmin` applies to **every unit
+separately**. If units differ in level, a floor that suits the lowest unit
+lets meboot stretch the tails of higher units far below anything they have
+recorded. Use `xmin_rel` or limits named by unit to avoid this. With
+`xmin = 0`, draws can fall far below any observed value in either mode.
 
 ## Output
 
@@ -287,6 +313,20 @@ data may not satisfy, so read the coverage as approximate. In the Kansas
 example below the intervals come out far too small; see the note after the
 jackknife table.
 
+**Implementation note.** The intervals are computed with
+`conformalInference::conformal.pred.jack()`. That function mishandles a
+prediction function that returns a single column, as a LASSO predicted at
+one penalty does: an internal `t()` turns its vector of leave-one-out
+residuals into a 1 x n matrix, so only the residual of the *first*
+pre-treatment period is used, and the interval does not change with
+`conform_level`. `synth_lasso_boot()`, and `synth_lasso_placebo()` which
+uses it, avoid this by returning two identical prediction columns and
+using the first; the intervals then equal the full-model prediction plus or
+minus the `conform_level` quantile of all the leave-one-out residuals.
+Jackknife results from versions of these functions before this fix, or from
+other code that calls `conformal.pred.jack()` with a single prediction
+column, should be recomputed.
+
 ### Maximum entropy bootstrap
 
 The bootstrap effect and cumulative-effect intervals were inspired by the
@@ -309,8 +349,29 @@ The `conf_int` quantiles across replicates give `eff_low`/`eff_high` and
 
 With `boot_by_unit = FALSE`, each variable is bootstrapped as one long
 series across all units, so a unit's draws depend on where its values fall
-among the other units' values. `boot_by_unit = TRUE` resamples each unit's
-own history.
+among the other units' values. Because the pooled values are so close
+together, each value moves very little, and the resulting intervals can be
+narrow. `boot_by_unit = TRUE` resamples each unit's own history, so the
+changes reflect that unit's own variability and the intervals are wider.
+
+#### Shared draws
+
+meboot's only random step is a set of random numbers that decides, rank by
+rank, whether each value in a series is nudged up or down. With
+`boot_by_unit = TRUE` and `shared_draws = FALSE`, every unit gets its own
+random numbers, so units are perturbed independently. With
+`shared_draws = TRUE`, every unit uses the same random numbers within each
+variable and replicate. Each unit still draws within its own range, but
+units are nudged in the same direction at the same rank. For trending
+series such as GDP, rank closely follows time, so units then move together
+over time, much as real economies share common shocks.
+
+Shared draws are a practical adjustment rather than a standard meboot
+procedure. They assume that shocks line up exactly by rank across units,
+which overstates how closely real units move together, and they align units
+in time only when the series trend. Because each replicate's effect is
+measured against the **observed** treated outcome, sharing draws does not
+by itself make the effect intervals narrower.
 
 ## Example: Kansas GDP per capita
 
@@ -417,6 +478,11 @@ kansas_m1$effects |>
 > For the same reasons, `outside_interval = TRUE` is not reliable evidence
 > of an effect here. The bootstrap intervals and the sensitivity bounds
 > give a more realistic picture of the uncertainty.
+>
+> These intervals are computed after the fix described in the
+> [implementation note](#jackknife-conformal-prediction-intervals); before
+> it, they used only the first pre-treatment residual and were narrower
+> still.
 
 Average width of each interval over the post-treatment quarters:
 
@@ -470,7 +536,8 @@ kansas_m1$effects |>
 
 Donor-state population is added as a control and rescaled to the donors'
 scale. Colorado is kept in the model without a penalty, cross-validation
-chooses the penalty, and each state is bootstrapped separately.
+chooses the penalty, and each state is bootstrapped separately, with
+shared draws and lower limits at 90% of each state's own minimum.
 
 ```{r}
 #| label: model-2
@@ -492,9 +559,10 @@ kansas_m2 <- synth_lasso_boot(
   M                = 1,
   jack_conform     = TRUE,
   reps             = n_reps,
-  trim             = list(gdpcapita   = list(trim = 0.10, xmin = 15000),
-                          popestimate = list(trim = 0.10, xmin = 450000)),
+  trim             = list(gdpcapita   = list(trim = 0.10, xmin_rel = 0.9),
+                          popestimate = list(trim = 0.10, xmin_rel = 0.9)),
   boot_by_unit     = TRUE,
+  shared_draws     = TRUE,
   conf_int         = 0.95
 )
 

@@ -10,6 +10,8 @@
 #   2. synth_lasso_boot()  - LASSO synthetic control with sensitivity bounds,
 #                            jackknife conformal intervals, and bootstrap
 #                            effect / cumulative-effect intervals
+#   3. synth_lasso_placebo() - the same model with exact placebo (permutation)
+#                            tests and CIs instead of the bootstrap
 #
 # Usage:
 #   source("Synthetic_control_functions/synthetic_control_functions_claude.R")
@@ -39,9 +41,20 @@
 #               OR a named list with one list per column, e.g.
 #                 list(gdpcapita   = list(trim = 0.10, xmin = 0),
 #                      lngdpcapita = list(trim = 0.10, xmin = NULL))
-#               Missing elements (trim / xmin / xmax) are filled with the
-#               meboot defaults (trim = 0.10, xmin = NULL, xmax = NULL);
-#               columns not listed get the defaults.
+#               Settings within each list:
+#                 trim      trimmed-mean proportion (default 0.10)
+#                 xmin/xmax absolute lower / upper tail limits. One number
+#                           for every series, or - with group_col - a
+#                           vector with at most one unnamed default and
+#                           values named by group, e.g.
+#                           xmin = c(15000, Alaska = 30000)
+#                 xmin_rel  lower limit as a fraction of EACH series' own
+#                           minimum, e.g. 0.9 (positive data only)
+#                 xmax_rel  upper limit as a multiple of each series' own
+#                           maximum, e.g. 1.1 (positive data only)
+#               Give xmin or xmin_rel (xmax or xmax_rel), not both. Unset
+#               limits use the meboot defaults; columns not listed get the
+#               defaults. A limit inside the observed range is an error.
 #   group_col   optional column name. NULL (default) bootstraps each column
 #               as one stacked series, exactly like the Kansas example.
 #               If set (e.g. "state"), each group's series is bootstrapped
@@ -53,6 +66,10 @@
 #   names_sep   separator for wide column names when more than one column
 #               is bootstrapped (e.g. "gdpcapita_Kansas")
 #   seed        optional seed, set once before any bootstrapping
+#   shared_draws  with group_col only: TRUE gives every group the same
+#               random numbers within each column and replicate, so groups
+#               are nudged up or down together (by rank). FALSE (default)
+#               draws independently for every group.
 #   as_matrix   if TRUE, each list element is converted with as.matrix()
 #               (useful for glmnet). All columns must be numeric for a
 #               numeric matrix.
@@ -75,6 +92,7 @@ meboot_multi <- function(data,
                          names_sep = "_",
                          seed = NULL,
                          as_matrix = FALSE,
+                         shared_draws = FALSE,
                          ...) {
   
   output <- match.arg(output)
@@ -110,10 +128,13 @@ meboot_multi <- function(data,
   id_cols <- unique(c(id_cols, group_col, names_from))
   
   ## ---- Build a trim list for each column ---------------------------------
-  trim_default <- list(trim = 0.10, xmin = NULL, xmax = NULL)
-  trim_keys <- c("trim", "xmin", "xmax")
+  # Keys: trim, xmin, xmax (absolute limits) and xmin_rel, xmax_rel (limits
+  # relative to each series' own minimum / maximum).
+  trim_default <- list(trim = 0.10, xmin = NULL, xmax = NULL,
+                       xmin_rel = NULL, xmax_rel = NULL)
+  trim_keys <- names(trim_default)
   
-  # One list for all columns if every name is trim / xmin / xmax
+  # One list for all columns if every name is a trim key
   is_global_trim <- !is.null(names(trim)) && all(names(trim) %in% trim_keys)
   
   if (is_global_trim) {
@@ -123,11 +144,17 @@ meboot_multi <- function(data,
   } else {
     bad_names <- setdiff(names(trim), boot_cols)
     if (is.null(names(trim)) || length(bad_names) > 0) {
-      stop("trim must be a single list (trim/xmin/xmax) or a list named by ",
-           "boot_cols. Unrecognised name(s): ", paste(bad_names, collapse = ", "))
+      stop("trim must be a single list (", paste(trim_keys, collapse = "/"),
+           ") or a list named by boot_cols. Unrecognised name(s): ",
+           paste(bad_names, collapse = ", "))
     }
     trim_list <- lapply(boot_cols, function(col) {
       if (col %in% names(trim)) {
+        bad_keys <- setdiff(names(trim[[col]]), trim_keys)
+        if (length(bad_keys) > 0) {
+          stop("trim for ", col, ": unknown setting(s) ", paste(bad_keys, collapse = ", "),
+               ". Use ", paste(trim_keys, collapse = ", "), ".")
+        }
         utils::modifyList(trim_default, trim[[col]], keep.null = TRUE)
       } else {
         trim_default
@@ -136,27 +163,104 @@ meboot_multi <- function(data,
     names(trim_list) <- boot_cols
   }
   
+  groups <- if (is.null(group_col)) NULL else unique(as.character(data[[group_col]]))
+  
+  # Check limits named by unit before any bootstrapping
+  for (col in boot_cols) {
+    for (key in c("xmin", "xmax")) {
+      val <- trim_list[[col]][[key]]
+      if (!is.null(trim_list[[col]][[paste0(key, "_rel")]]) && !is.null(val)) {
+        stop("trim for ", col, ": give ", key, " or ", key, "_rel, not both.")
+      }
+      nm <- names(val)
+      if (!is.null(nm) && any(nm != "")) {
+        if (is.null(group_col)) {
+          stop("trim for ", col, ": limits named by unit (", key, ") need group_col ",
+               "(boot_by_unit = TRUE in synth_lasso_boot()).")
+        }
+        if (sum(nm == "") > 1) {
+          stop("trim for ", col, ": ", key, " can have at most one unnamed default value.")
+        }
+        unknown <- setdiff(nm[nm != ""], groups)
+        if (length(unknown) > 0) {
+          stop("trim for ", col, ": ", key, " names unit(s) not in the data: ",
+               paste(unknown, collapse = ", "))
+        }
+      }
+    }
+  }
+  
+  # The meboot trim list for one series (one column, and one group if grouped)
+  series_trim <- function(col, x, group = NULL) {
+    spec <- trim_list[[col]]
+    where <- if (is.null(group)) col else paste0(col, " (", group, ")")
+    
+    pick <- function(val) {
+      if (is.null(val)) return(NULL)
+      nm <- names(val)
+      if (is.null(nm) || all(nm == "")) return(unname(val[1]))
+      if (!is.null(group) && group %in% nm) return(unname(val[group]))
+      if (any(nm == "")) return(unname(val[nm == ""][1]))
+      NULL
+    }
+    
+    xmin <- pick(spec$xmin)
+    xmax <- pick(spec$xmax)
+    
+    if (!is.null(spec$xmin_rel)) {
+      if (any(x <= 0)) stop("xmin_rel needs strictly positive values; ", where, " has values <= 0. Use xmin instead.")
+      if (spec$xmin_rel > 1) stop("xmin_rel must be <= 1 (a fraction of the series minimum).")
+      xmin <- spec$xmin_rel * min(x)
+    }
+    if (!is.null(spec$xmax_rel)) {
+      if (any(x <= 0)) stop("xmax_rel needs strictly positive values; ", where, " has values <= 0. Use xmax instead.")
+      if (spec$xmax_rel < 1) stop("xmax_rel must be >= 1 (a multiple of the series maximum).")
+      xmax <- spec$xmax_rel * max(x)
+    }
+    
+    if (!is.null(xmin) && xmin > min(x)) {
+      stop("xmin for ", where, " (", signif(xmin, 6), ") is above its lowest value (",
+           signif(min(x), 6), ").")
+    }
+    if (!is.null(xmax) && xmax < max(x)) {
+      stop("xmax for ", where, " (", signif(xmax, 6), ") is below its highest value (",
+           signif(max(x), 6), ").")
+    }
+    list(trim = spec$trim, xmin = xmin, xmax = xmax)
+  }
+  
   ## ---- Run meboot for each column (and group) ----------------------------
+  if (shared_draws && is.null(group_col)) {
+    warning("shared_draws only applies when bootstrapping by group (group_col); ignored.")
+    shared_draws <- FALSE
+  }
+  
   if (!is.null(seed)) set.seed(seed)
+  
+  # With shared draws, every group of a column restarts from the same seed, so
+  # meboot draws the same random numbers for each group in each replicate.
+  col_seeds <- if (shared_draws) sample.int(.Machine$integer.max, length(boot_cols)) else NULL
   
   run_meboot <- function(x, col_trim) {
     ens <- meboot::meboot(x, reps = reps, trim = col_trim, ...)$ensemble
     as.matrix(ens)  # rows = observations, columns = replicates
   }
   
-  ensembles <- lapply(boot_cols, function(col) {
+  ensembles <- lapply(seq_along(boot_cols), function(j) {
+    col <- boot_cols[j]
     x <- data[[col]]
     
     if (is.null(group_col)) {
-      return(run_meboot(x, trim_list[[col]]))
+      return(run_meboot(x, series_trim(col, x)))
     }
     
     # Bootstrap each group separately and put results back in original rows
     ens <- matrix(NA_real_, nrow = length(x), ncol = reps)
-    row_index <- split(seq_along(x), data[[group_col]])
+    row_index <- split(seq_along(x), as.character(data[[group_col]]))
     for (g in names(row_index)) {
       rows <- row_index[[g]]
-      ens[rows, ] <- run_meboot(x[rows], trim_list[[col]])
+      if (shared_draws) set.seed(col_seeds[j])
+      ens[rows, ] <- run_meboot(x[rows], series_trim(col, x[rows], g))
     }
     ens
   })
@@ -335,19 +439,35 @@ meboot_multi <- function(data,
 #                   pre-period residual (default 1)
 #   jack_conform    TRUE adds jackknife conformal prediction intervals for the
 #                   post period (needs conformalInference)
+#                   The intervals come from conformalInference::conformal.pred.jack().
+#                   That function mishandles a single prediction column (it then
+#                   uses only the first leave-one-out residual, whatever the level),
+#                   so the prediction function here returns two identical columns
+#                   and the first is used.
 #   conform_level   coverage of the conformal intervals (default 0.95)
 #
 # ---- Bootstrap arguments ------------------------------------------------------
 #   boot            TRUE (default) runs the bootstrap
 #   reps            number of bootstrap replicates (default 1000)
-#   trim            meboot trim / xmin / xmax, passed to meboot_multi().
-#                   One list for every bootstrapped column, or a list named
-#                   by column, e.g.
+#   trim            meboot limits, passed to meboot_multi(). One list for
+#                   every bootstrapped column, or a list named by column.
+#                   Settings: trim, xmin, xmax, xmin_rel, xmax_rel, e.g.
 #                     list(gdpcapita   = list(xmin = 15000),
 #                          popestimate = list(xmin = 450000))
+#                   With boot_by_unit = TRUE, limits can differ by unit:
+#                     xmin = c(15000, Alaska = 30000)   named by unit, or
+#                     xmin_rel = 0.9   90% of EACH unit's own minimum
+#                     xmax_rel = 1.1   110% of each unit's own maximum
+#                   (relative limits need strictly positive data)
 #   boot_by_unit    FALSE (default) bootstraps each variable as one stacked
 #                   series in the row order of `data` (reproduces the Kansas
 #                   script). TRUE bootstraps each unit's series separately.
+#   shared_draws    with boot_by_unit = TRUE: TRUE uses the same random
+#                   numbers for every unit (within each variable and
+#                   replicate), so units are nudged up or down together by
+#                   rank and keep their co-movement. FALSE (default) draws
+#                   independently for each unit. Ignored, with a warning,
+#                   when boot_by_unit = FALSE.
 #   boot_nlambda    lambda path length for the bootstrap glmnet refits
 #                   (default 100, as in bootstrap_cum_effects_fixed)
 #   conf_int        interval level for bootstrap effects (default 0.95)
@@ -402,6 +522,7 @@ synth_lasso_boot <- function(data,
                              reps = 1000,
                              trim = list(trim = 0.10, xmin = NULL, xmax = NULL),
                              boot_by_unit = FALSE,
+                             shared_draws = FALSE,
                              boot_nlambda = 100,
                              conf_int = 0.95,
                              boot_seed = seed,
@@ -660,7 +781,9 @@ synth_lasso_boot <- function(data,
   ## ---- Optional jackknife conformal intervals ----------------------------
   if (jack_conform) {
     train_fun <- function(x, y, out = NULL) fit_glmnet(x, y, nlambda)
-    pred_fun <- function(out, newx) stats::predict(out, newx, s = lambda_used)
+    # conformal.pred.jack() mishandles a single prediction column (t() of a vector makes res 1 x n, so only
+    # the first leave-one-out residual is used). Returning two identical columns avoids this; column 1 is used.
+    pred_fun <- function(out, newx) { p <- stats::predict(out, newx, s = lambda_used); cbind(p, p) }
     
     limits_jack <- conformalInference::conformal.pred.jack(
       x = X_obs[pre, , drop = FALSE], y = y_obs[pre],
@@ -670,8 +793,8 @@ synth_lasso_boot <- function(data,
     
     effects$pred_jack_lo <- NA_real_
     effects$pred_jack_hi <- NA_real_
-    effects$pred_jack_lo[post] <- as.numeric(limits_jack$lo)
-    effects$pred_jack_hi[post] <- as.numeric(limits_jack$up)
+    effects$pred_jack_lo[post] <- as.numeric(as.matrix(limits_jack$lo)[, 1])
+    effects$pred_jack_hi[post] <- as.numeric(as.matrix(limits_jack$up)[, 1])
   }
   
   ## ---- 2 + 3. Bootstrap and refit ----------------------------------------
@@ -690,6 +813,7 @@ synth_lasso_boot <- function(data,
                                reps       = reps,
                                trim       = trim,
                                group_col  = if (boot_by_unit) unit_col else NULL,
+                               shared_draws = shared_draws,
                                output     = "wide",
                                names_from = unit_col,
                                seed       = boot_seed,
@@ -759,9 +883,268 @@ synth_lasso_boot <- function(data,
                    lambda_choice = lambda_choice, lambda_used = lambda_used,
                    n_pre = sum(pre), n_post = sum(post),
                    boot = boot, reps = if (boot) reps else NA,
-                   boot_by_unit = boot_by_unit, trim = trim, conf_int = conf_int,
+                   boot_by_unit = boot_by_unit, shared_draws = shared_draws,
+                   trim = trim, conf_int = conf_int,
                    seed = seed, boot_seed = boot_seed)
   
   list(effects = effects, fit_stats = fit_stats, weights = weights,
        model = cv.fit, boot = boot_out, settings = settings)
+}
+
+
+## ===========================================================================
+## 3. synth_lasso_placebo()
+## ===========================================================================
+
+##############################################################################
+# synth_lasso_placebo(): LASSO synthetic control with exact placebo
+#                        (permutation) tests and confidence intervals
+#
+# Same model and arguments as synth_lasso_boot(), but the bootstrap intervals
+# are replaced by exact placebo tests:
+#   1. Fit the treated unit (identical to synth_lasso_boot(), boot = FALSE).
+#   2. Drop the treated unit. Fit every donor in turn as a placebo "treated"
+#      unit, from the remaining donors, with the same settings.
+#   3. Optionally keep only placebos with a good pre-treatment fit (Abadie,
+#      Diamond and Hainmueller 2010): pre-period MSPE <= abadie_cutoff x the
+#      treated unit's pre-period MSPE (typically 5 or 2).
+#   4. For every post-treatment period, test the treated unit's gap against the
+#      placebo gaps, for the per-period effect and for the cumulative effect
+#      through that period. Gaps are relative: (observed - synthetic) /
+#      synthetic; cumulative gaps are sum(gap) / sum(synthetic).
+#
+# Exact tests with N placebos (N + 1 units), alpha = 1 - conf_level:
+#   absolute  p = (1 + #{|placebo gap| >= |treated gap|}) / (N + 1)
+#             CI = treated gap +/- the k-th largest |placebo gap|,
+#             k = floor(alpha x (N + 1))
+#   signed    p = min(1, 2 x min(lower-tail p, upper-tail p))
+#             CI = [treated gap - k2-th largest placebo gap,
+#                   treated gap - k2-th smallest placebo gap],
+#             k2 = floor(alpha / 2 x (N + 1))
+#   The CIs are the effect sizes the test does not reject (test inversion);
+#   a CI excludes zero exactly when p <= alpha. If k (or k2) is 0 there are
+#   too few placebos for conf_level and the CI is infinite (with a warning):
+#   the absolute test needs N >= 1/alpha - 1 placebos, the signed test
+#   N >= 2/alpha - 1 (19 and 39 at 95%).
+#   CIs are computed on the relative scale and converted to outcome units by
+#   multiplying by the treated unit's synthetic value (or its running total).
+#
+# Arguments: as synth_lasso_boot() for the data, controls, LASSO fit, M bounds
+# and jackknife (see its documentation). Bootstrap arguments are replaced by:
+#   conf_level     confidence level of the placebo CIs (default 0.95)
+#   abadie_cutoff  NULL (default) keeps every placebo; a number (e.g. 5 or 2)
+#                  keeps placebos whose pre-period MSPE is at most that many
+#                  times the treated unit's
+#   n_cores        number of cores for the placebo fits (default 1; > 1 runs
+#                  them in parallel)
+#
+# Named settings (lower_constr / upper_constr / unpenalized entries naming a
+# donor or <control>_<unit> column) are applied in a placebo run only when that
+# column exists in it; e.g. unpenalized = "Colorado" is dropped in the run
+# where Colorado is the placebo.
+#
+# Value: a list
+#   effects    one row per period, as in synth_lasso_boot() (without bootstrap
+#              columns), plus for post-treatment periods:
+#              att_rel, cum_att_rel         relative gap and cumulative gap
+#              p_abs, eff_low_abs, eff_high_abs              per-period, absolute
+#              p_signed, eff_low_signed, eff_high_signed     per-period, signed
+#              cum_p_abs, cum_eff_low_abs, cum_eff_high_abs  cumulative, absolute
+#              cum_p_signed, cum_eff_low_signed, cum_eff_high_signed
+#                                                            cumulative, signed
+#              (intervals in outcome units)
+#   fit_stats, weights, model   as in synth_lasso_boot()
+#   placebo    list: gaps and cum_gaps (post periods x placebos, relative),
+#              fit (each placebo's pre-period MSPE, its ratio to the treated
+#              unit's, and whether it was kept), n_kept, n_failed
+#   settings   the settings used
+##############################################################################
+
+synth_lasso_placebo <- function(data,
+                                unit_col,
+                                time_cols,
+                                outcome_col,
+                                treated_unit,
+                                treatment_period,
+                                controls = NULL,
+                                control_units = c("all", "donors", "treated"),
+                                intercept = TRUE,
+                                lower_constr = 0,
+                                upper_constr = 1,
+                                control_lower = -Inf,
+                                control_upper = Inf,
+                                unpenalized = NULL,
+                                standardize = FALSE,
+                                scale_controls = FALSE,
+                                nlambda = 1000,
+                                lambda_choice = c("min_path", "lambda.min", "lambda.1se"),
+                                seed,
+                                M = 1,
+                                jack_conform = FALSE,
+                                conform_level = 0.95,
+                                conf_level = 0.95,
+                                abadie_cutoff = NULL,
+                                n_cores = 1) {
+  
+  control_units <- match.arg(control_units)
+  lambda_choice <- match.arg(lambda_choice)
+  data <- as.data.frame(data)
+  
+  ## ---- Checks ------------------------------------------------------------
+  if (missing(seed)) stop("Please supply a seed for reproducibility.")
+  if (!is.numeric(conf_level) || length(conf_level) != 1 || conf_level <= 0 || conf_level >= 1) {
+    stop("conf_level must be a single number between 0 and 1, e.g. 0.95.")
+  }
+  if (!is.null(abadie_cutoff) &&
+      (!is.numeric(abadie_cutoff) || length(abadie_cutoff) != 1 || abadie_cutoff <= 0)) {
+    stop("abadie_cutoff must be NULL or a single positive number, e.g. 5 or 2.")
+  }
+  if (!is.numeric(n_cores) || length(n_cores) != 1 || n_cores < 1) {
+    stop("n_cores must be a single number >= 1.")
+  }
+  alpha <- round(1 - conf_level, 10)   # avoid floating-point error in the rank (e.g. 1 - 0.9)
+  
+  # Arguments shared by every fit (treated and placebo)
+  common <- list(unit_col = unit_col, time_cols = time_cols, outcome_col = outcome_col,
+                 treatment_period = treatment_period, controls = controls,
+                 control_units = control_units, intercept = intercept,
+                 control_lower = control_lower, control_upper = control_upper,
+                 standardize = standardize, scale_controls = scale_controls,
+                 nlambda = nlambda, lambda_choice = lambda_choice, seed = seed, boot = FALSE)
+  
+  ## ---- 1. Treated unit (same as synth_lasso_boot, no bootstrap) ----------
+  main <- do.call(synth_lasso_boot, c(common, list(
+    data = data, treated_unit = treated_unit, lower_constr = lower_constr,
+    upper_constr = upper_constr, unpenalized = unpenalized, M = M,
+    jack_conform = jack_conform, conform_level = conform_level)))
+  eff <- main$effects
+  post <- eff$post
+  treated_pre_mspe <- mean(eff$att[!post]^2)
+  
+  ## ---- 2. Placebo fits: every donor, treated unit removed ----------------
+  pl_data <- data[as.character(data[[unit_col]]) != treated_unit, ]
+  pl_units <- unique(as.character(pl_data[[unit_col]]))
+  if (length(pl_units) < 3) stop("At least 3 donor units are needed for placebo runs.")
+  
+  # Keep only named settings that exist as predictors in a given placebo run
+  predictor_names <- function(p) {
+    donors_p <- setdiff(pl_units, p)
+    ctrl_p <- switch(control_units, all = pl_units, donors = donors_p, treated = p)
+    c(donors_p, unlist(lapply(controls, function(v) paste(v, ctrl_p, sep = "_"))))
+  }
+  keep_named <- function(spec, ok) {
+    nm <- names(spec)
+    if (is.null(nm)) return(spec)
+    spec[nm == "" | nm %in% ok]
+  }
+  placebo_fit <- function(p) {
+    ok <- predictor_names(p)
+    unpen_p <- intersect(unpenalized, ok)
+    m <- tryCatch(
+      do.call(synth_lasso_boot, c(common, list(
+        data = pl_data, treated_unit = p,
+        lower_constr = keep_named(lower_constr, ok), upper_constr = keep_named(upper_constr, ok),
+        unpenalized = if (length(unpen_p) > 0) unpen_p else NULL))),
+      error = function(e) conditionMessage(e))
+    if (is.character(m)) return(list(error = m))
+    e <- m$effects
+    list(gap_rel = e$att[e$post] / e$treated_predicted[e$post],
+         cum_gap_rel = cumsum(e$att[e$post]) / cumsum(e$treated_predicted[e$post]),
+         pre_mspe = mean(e$att[!e$post]^2))
+  }
+  
+  if (n_cores > 1) {
+    cl <- parallel::makeCluster(min(n_cores, length(pl_units)))
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    fn_env <- environment(sys.function())
+    parallel::clusterExport(cl, intersect(c("synth_lasso_boot", "meboot_multi"), ls(fn_env)), envir = fn_env)
+    fits <- parallel::parLapplyLB(cl, pl_units, placebo_fit)
+  } else {
+    fits <- lapply(pl_units, placebo_fit)
+  }
+  names(fits) <- pl_units
+  
+  failed <- vapply(fits, function(f) !is.null(f$error), logical(1))
+  if (any(failed)) {
+    warning(sum(failed), " placebo fit(s) failed and were left out: ",
+            paste(names(fits)[failed], collapse = ", "), ". First error: ", fits[[which(failed)[1]]]$error)
+  }
+  fits <- fits[!failed]
+  if (length(fits) == 0) stop("All placebo fits failed.")
+  
+  G  <- sapply(fits, `[[`, "gap_rel");     G  <- matrix(G,  nrow = sum(post), dimnames = list(NULL, names(fits)))
+  Gc <- sapply(fits, `[[`, "cum_gap_rel"); Gc <- matrix(Gc, nrow = sum(post), dimnames = list(NULL, names(fits)))
+  pl_mspe <- vapply(fits, `[[`, numeric(1), "pre_mspe")
+  
+  ## ---- 3. Abadie filter on pre-treatment fit -------------------------------
+  kept <- if (is.null(abadie_cutoff)) rep(TRUE, length(fits)) else pl_mspe <= abadie_cutoff * treated_pre_mspe
+  n_kept <- sum(kept)
+  fit_table <- data.frame(unit = names(fits), pre_mspe = pl_mspe,
+                          mspe_ratio_to_treated = pl_mspe / treated_pre_mspe, kept = kept, row.names = NULL)
+  
+  if (floor(alpha * (n_kept + 1)) == 0) {
+    warning(n_kept, " placebos kept: too few for a ", 100 * conf_level,
+            "% absolute CI (needs ", ceiling(1 / alpha - 1), "); absolute CIs are infinite.")
+  }
+  if (floor(alpha / 2 * (n_kept + 1)) == 0) {
+    warning(n_kept, " placebos kept: too few for a ", 100 * conf_level,
+            "% signed CI (needs ", ceiling(2 / alpha - 1), "); signed CIs are infinite.")
+  }
+  
+  ## ---- 4. Exact tests and inverted CIs, every post period ----------------
+  exact_tests <- function(t, g) {
+    n1 <- length(g) + 1
+    p_abs <- (1 + sum(abs(g) >= abs(t))) / n1
+    k <- floor(alpha * n1)
+    a_k <- if (k == 0) Inf else sort(abs(g), decreasing = TRUE)[k]
+    p_sgn <- min(1, 2 * min((1 + sum(g <= t)) / n1, (1 + sum(g >= t)) / n1))
+    k2 <- floor(alpha / 2 * n1)
+    gs <- sort(g)
+    c(p_abs = p_abs, abs_lo = t - a_k, abs_hi = t + a_k, p_signed = p_sgn,
+      signed_lo = if (k2 == 0) -Inf else t - gs[length(g) + 1 - k2],
+      signed_hi = if (k2 == 0)  Inf else t - gs[k2])
+  }
+  
+  pred_post <- eff$treated_predicted[post]
+  att_rel <- eff$att[post] / pred_post
+  cum_att_rel <- cumsum(eff$att[post]) / cumsum(pred_post)
+  test_names <- c("p_abs", "abs_lo", "abs_hi", "p_signed", "signed_lo", "signed_hi")
+  per <- t(vapply(seq_along(att_rel), function(h) exact_tests(att_rel[h], G[h, kept]),
+                  setNames(numeric(6), test_names)))
+  cum <- t(vapply(seq_along(cum_att_rel), function(h) exact_tests(cum_att_rel[h], Gc[h, kept]),
+                  setNames(numeric(6), test_names)))
+  
+  add_col <- function(name, values) {
+    eff[[name]] <<- NA_real_
+    eff[[name]][post] <<- values
+  }
+  add_col("att_rel", att_rel)
+  add_col("cum_att_rel", cum_att_rel)
+  add_col("p_abs", per[, "p_abs"])
+  add_col("eff_low_abs", per[, "abs_lo"] * pred_post)
+  add_col("eff_high_abs", per[, "abs_hi"] * pred_post)
+  add_col("p_signed", per[, "p_signed"])
+  add_col("eff_low_signed", per[, "signed_lo"] * pred_post)
+  add_col("eff_high_signed", per[, "signed_hi"] * pred_post)
+  add_col("cum_p_abs", cum[, "p_abs"])
+  add_col("cum_eff_low_abs", cum[, "abs_lo"] * cumsum(pred_post))
+  add_col("cum_eff_high_abs", cum[, "abs_hi"] * cumsum(pred_post))
+  add_col("cum_p_signed", cum[, "p_signed"])
+  add_col("cum_eff_low_signed", cum[, "signed_lo"] * cumsum(pred_post))
+  add_col("cum_eff_high_signed", cum[, "signed_hi"] * cumsum(pred_post))
+  eff$treated_unit <- NULL
+  eff$treated_unit <- treated_unit
+  
+  settings <- main$settings
+  settings$boot <- NULL; settings$reps <- NULL; settings$boot_by_unit <- NULL
+  settings$shared_draws <- NULL; settings$trim <- NULL; settings$conf_int <- NULL
+  settings$boot_seed <- NULL
+  settings <- c(settings, list(inference = "placebo", conf_level = conf_level,
+                               abadie_cutoff = abadie_cutoff, treated_pre_mspe = treated_pre_mspe,
+                               n_placebos = length(fits), n_placebos_kept = n_kept))
+  
+  list(effects = eff, fit_stats = main$fit_stats, weights = main$weights, model = main$model,
+       placebo = list(gaps = G, cum_gaps = Gc, fit = fit_table, n_kept = n_kept,
+                      n_failed = sum(failed)),
+       settings = settings)
 }

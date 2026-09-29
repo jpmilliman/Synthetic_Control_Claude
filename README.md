@@ -134,15 +134,34 @@ The treated unit’s own controls after treatment may themselves be affected by 
 |----|----|----|
 | `boot` | `TRUE` | Run the bootstrap. `FALSE` returns only the observed fit. |
 | `reps` | `1000` | Number of bootstrap replicates. |
-| `trim` | `list(trim = 0.10, xmin = NULL, xmax = NULL)` | meboot `trim`/`xmin`/`xmax`. One list for every bootstrapped variable, or a list named by variable, e.g. `list(gdpcapita = list(xmin = 15000), popestimate = list(xmin = 450000))`. |
+| `trim` | `list(trim = 0.10, xmin = NULL, xmax = NULL)` | Bootstrap limits: one list for every bootstrapped variable, or a list named by variable. Settings: `trim`, `xmin`, `xmax`, `xmin_rel`, `xmax_rel` (see [Bootstrap limits](#bootstrap-limits)). |
 | `boot_by_unit` | `FALSE` | `FALSE` bootstraps each variable as one stacked series across all units, in the row order of `data`. `TRUE` bootstraps each unit’s series separately, so each unit keeps its own time dependence. |
+| `shared_draws` | `FALSE` | With `boot_by_unit = TRUE`: `TRUE` gives every unit the same random numbers (within each variable and replicate), so units are nudged up or down together. `FALSE` draws independently for each unit. Ignored, with a warning, when `boot_by_unit = FALSE`. |
 | `boot_nlambda` | `100` | Lambda path length for the bootstrap refits. |
 | `conf_int` | `0.95` | Level of the bootstrap effect and cumulative-effect intervals. |
 | `boot_seed` | `seed` | Seed for the bootstrap. |
 | `keep_boot` | `FALSE` | `TRUE` also returns the bootstrap replicates (can be large). |
 | `...` |  | Further arguments passed to `meboot::meboot()`, e.g. `reachbnd`, `expand.sd`, `force.clt`. |
 
-**Choosing `xmin`.** meboot stretches the lower tail of each series down to `xmin`. With `xmin = 0`, some draws can fall far below any observed value. Set it to a plausible floor for the variable instead.
+#### Bootstrap limits
+
+meboot stretches the lower tail of each series down to `xmin` and the upper tail up to `xmax`, so these limits decide how far the most extreme draws can go. Each variable’s list in `trim` can contain:
+
+| Setting | Meaning |
+|----|----|
+| `trim` | Trimmed-mean proportion meboot uses for the default tail limits (default `0.10`). |
+| `xmin`, `xmax` | Absolute limits. One number applies to every series. With `boot_by_unit = TRUE`, a vector can hold one unnamed default plus values named by unit, e.g. `xmin = c(15000, Alaska = 35000)`. |
+| `xmin_rel` | Lower limit as a fraction of **each series’ own minimum**, e.g. `0.9` = 90% of each unit’s lowest value. |
+| `xmax_rel` | Upper limit as a multiple of each series’ own maximum, e.g. `1.1`. |
+
+``` r
+trim = list(gdpcapita   = list(xmin_rel = 0.9, xmax_rel = 1.1),
+            popestimate = list(xmin = c(450000, California = 29000000)))
+```
+
+Give `xmin` or `xmin_rel` (and `xmax` or `xmax_rel`), not both. Relative limits need strictly positive data. A limit inside a series’ observed range (for example, an `xmin` above its lowest value) stops with an error. Unset limits use meboot’s defaults.
+
+With `boot_by_unit = TRUE`, a single `xmin` applies to **every unit separately**. If units differ in level, a floor that suits the lowest unit lets meboot stretch the tails of higher units far below anything they have recorded. Use `xmin_rel` or limits named by unit to avoid this. With `xmin = 0`, draws can fall far below any observed value in either mode.
 
 ## Output
 
@@ -206,6 +225,8 @@ With `jack_conform = TRUE`, the function builds a prediction interval around eac
 
 `pred_jack_lo` and `pred_jack_hi` are therefore intervals for the **counterfactual outcome** (what the treated unit would have been without treatment), not for the effect. If the observed outcome falls outside the interval, it is unusual relative to the model’s out-of-sample error. The method treats the pre-treatment periods as exchangeable, which time series data may not satisfy, so read the coverage as approximate. In the Kansas example below the intervals come out far too small; see the note after the jackknife table.
 
+**Implementation note.** The intervals are computed with `conformalInference::conformal.pred.jack()`. That function mishandles a prediction function that returns a single column, as a LASSO predicted at one penalty does: an internal `t()` turns its vector of leave-one-out residuals into a 1 x n matrix, so only the residual of the *first* pre-treatment period is used, and the interval does not change with `conform_level`. `synth_lasso_boot()`, and `synth_lasso_placebo()` which uses it, avoid this by returning two identical prediction columns and using the first; the intervals then equal the full-model prediction plus or minus the `conform_level` quantile of all the leave-one-out residuals. Jackknife results from versions of these functions before this fix, or from other code that calls `conformal.pred.jack()` with a single prediction column, should be recomputed.
+
 ### Maximum entropy bootstrap
 
 The bootstrap effect and cumulative-effect intervals were inspired by the approach of Wong et al. (2023), who used LASSO regression to estimate the population-level impact of pneumococcal conjugate vaccines.
@@ -218,7 +239,13 @@ The bootstrap resamples each variable with `meboot()` from the **meboot** packag
 
 The `conf_int` quantiles across replicates give `eff_low`/`eff_high` and `cum_eff_low`/`cum_eff_high`.
 
-With `boot_by_unit = FALSE`, each variable is bootstrapped as one long series across all units, so a unit’s draws depend on where its values fall among the other units’ values. `boot_by_unit = TRUE` resamples each unit’s own history.
+With `boot_by_unit = FALSE`, each variable is bootstrapped as one long series across all units, so a unit’s draws depend on where its values fall among the other units’ values. Because the pooled values are so close together, each value moves very little, and the resulting intervals can be narrow. `boot_by_unit = TRUE` resamples each unit’s own history, so the changes reflect that unit’s own variability and the intervals are wider.
+
+#### Shared draws
+
+meboot’s only random step is a set of random numbers that decides, rank by rank, whether each value in a series is nudged up or down. With `boot_by_unit = TRUE` and `shared_draws = FALSE`, every unit gets its own random numbers, so units are perturbed independently. With `shared_draws = TRUE`, every unit uses the same random numbers within each variable and replicate. Each unit still draws within its own range, but units are nudged in the same direction at the same rank. For trending series such as GDP, rank closely follows time, so units then move together over time, much as real economies share common shocks.
+
+Shared draws are a practical adjustment rather than a standard meboot procedure. They assume that shocks line up exactly by rank across units, which overstates how closely real units move together, and they align units in time only when the series trend. Because each replicate’s effect is measured against the **observed** treated outcome, sharing draws does not by itself make the effect intervals narrower.
 
 ## Example: Kansas GDP per capita
 
@@ -333,22 +360,22 @@ kansas_m1$effects |>
 
 | period | treated_observed | treated_predicted | pred_jack_lo | pred_jack_hi | outside_interval |
 |:---|---:|---:|---:|---:|:---|
-| 2012_2 | 49016 | 50693 | 50451 | 50935 | TRUE |
-| 2012_3 | 48075 | 51111 | 50869 | 51353 | TRUE |
-| 2012_4 | 48290 | 51401 | 51159 | 51643 | TRUE |
-| 2013_1 | 49799 | 51676 | 51434 | 51917 | TRUE |
-| 2013_2 | 49247 | 51819 | 51577 | 52061 | TRUE |
-| 2013_3 | 49199 | 52584 | 52342 | 52826 | TRUE |
-| 2013_4 | 49969 | 52481 | 52239 | 52723 | TRUE |
-| 2014_1 | 49475 | 52857 | 52615 | 53099 | TRUE |
-| 2014_2 | 50685 | 54053 | 53811 | 54295 | TRUE |
-| 2014_3 | 51945 | 54799 | 54557 | 55041 | TRUE |
-| 2014_4 | 52526 | 54833 | 54591 | 55075 | TRUE |
-| 2015_1 | 51421 | 53893 | 53651 | 54135 | TRUE |
-| 2015_2 | 52291 | 53935 | 53693 | 54177 | TRUE |
-| 2015_3 | 52316 | 53822 | 53580 | 54064 | TRUE |
-| 2015_4 | 52183 | 53426 | 53185 | 53668 | TRUE |
-| 2016_1 | 51218 | 52900 | 52658 | 53142 | TRUE |
+| 2012_2 | 49016 | 50693 | 50069 | 51318 | TRUE |
+| 2012_3 | 48075 | 51111 | 50486 | 51736 | TRUE |
+| 2012_4 | 48290 | 51401 | 50777 | 52026 | TRUE |
+| 2013_1 | 49799 | 51676 | 51051 | 52300 | TRUE |
+| 2013_2 | 49247 | 51819 | 51194 | 52444 | TRUE |
+| 2013_3 | 49199 | 52584 | 51959 | 53209 | TRUE |
+| 2013_4 | 49969 | 52481 | 51856 | 53106 | TRUE |
+| 2014_1 | 49475 | 52857 | 52232 | 53482 | TRUE |
+| 2014_2 | 50685 | 54053 | 53428 | 54678 | TRUE |
+| 2014_3 | 51945 | 54799 | 54174 | 55424 | TRUE |
+| 2014_4 | 52526 | 54833 | 54208 | 55458 | TRUE |
+| 2015_1 | 51421 | 53893 | 53268 | 54517 | TRUE |
+| 2015_2 | 52291 | 53935 | 53310 | 54560 | TRUE |
+| 2015_3 | 52316 | 53822 | 53197 | 54446 | TRUE |
+| 2015_4 | 52183 | 53426 | 52802 | 54051 | TRUE |
+| 2016_1 | 51218 | 52900 | 52276 | 53525 | TRUE |
 
 > **Note: in this example the jackknife prediction intervals are far too small.** They are much narrower than the bootstrap intervals and the sensitivity band (compare the average widths below), and they should not be read as a realistic range for the counterfactual. Three things shrink them:
 >
@@ -358,6 +385,8 @@ kansas_m1$effects |>
 >     2012. 
 >
 > For the same reasons, `outside_interval = TRUE` is not reliable evidence of an effect here. The bootstrap intervals and the sensitivity bounds give a more realistic picture of the uncertainty.
+>
+> These intervals are computed after the fix described in the [implementation note](#jackknife-conformal-prediction-intervals); before it, they used only the first pre-treatment residual and were narrower still.
 
 Average width of each interval over the post-treatment quarters:
 
@@ -375,7 +404,7 @@ kansas_m1$effects |>
 
 | Interval                      | Average width |
 |:------------------------------|--------------:|
-| Jackknife prediction interval |           484 |
+| Jackknife prediction interval |          1250 |
 | Bootstrap effect interval     |          1523 |
 | Sensitivity band (M = 1)      |          3136 |
 
@@ -448,7 +477,7 @@ kansas_m1$effects |>
 
 ### Model 2: population as a control
 
-Donor-state population is added as a control and rescaled to the donors’ scale. Colorado is kept in the model without a penalty, cross-validation chooses the penalty, and each state is bootstrapped separately.
+Donor-state population is added as a control and rescaled to the donors’ scale. Colorado is kept in the model without a penalty, cross-validation chooses the penalty, and each state is bootstrapped separately, with shared draws and lower limits at 90% of each state’s own minimum.
 
 ``` r
 kansas_m2 <- synth_lasso_boot(
@@ -469,9 +498,10 @@ kansas_m2 <- synth_lasso_boot(
   M                = 1,
   jack_conform     = TRUE,
   reps             = n_reps,
-  trim             = list(gdpcapita   = list(trim = 0.10, xmin = 15000),
-                          popestimate = list(trim = 0.10, xmin = 450000)),
+  trim             = list(gdpcapita   = list(trim = 0.10, xmin_rel = 0.9),
+                          popestimate = list(trim = 0.10, xmin_rel = 0.9)),
   boot_by_unit     = TRUE,
+  shared_draws     = TRUE,
   conf_int         = 0.95
 )
 
@@ -511,22 +541,22 @@ kansas_m2$effects |>
 
 | period | treated_observed | treated_predicted | pred_jack_lo | pred_jack_hi | att | bounds_lo | bounds_hi | eff_low | eff_high |
 |:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 2012_2 | 49016 | 50505 | 50338 | 50673 | -1489 | -2797 | -180 | -2642 | 2447 |
-| 2012_3 | 48075 | 50748 | 50580 | 50916 | -2673 | -3982 | -1365 | -4614 | 1190 |
-| 2012_4 | 48290 | 51240 | 51073 | 51408 | -2950 | -4259 | -1642 | -5423 | 1262 |
-| 2013_1 | 49799 | 51698 | 51531 | 51866 | -1899 | -3207 | -590 | -3520 | 2378 |
-| 2013_2 | 49247 | 51835 | 51667 | 52002 | -2588 | -3897 | -1280 | -4559 | 1686 |
-| 2013_3 | 49199 | 52646 | 52479 | 52814 | -3447 | -4755 | -2138 | -5483 | 1027 |
-| 2013_4 | 49969 | 52721 | 52554 | 52889 | -2752 | -4061 | -1444 | -4731 | 1890 |
-| 2014_1 | 49475 | 53314 | 53147 | 53482 | -3839 | -5148 | -2531 | -6032 | 1227 |
-| 2014_2 | 50685 | 54607 | 54440 | 54775 | -3923 | -5231 | -2614 | -5780 | 1751 |
-| 2014_3 | 51945 | 55402 | 55234 | 55570 | -3458 | -4766 | -2149 | -5354 | 2415 |
-| 2014_4 | 52526 | 55667 | 55499 | 55835 | -3141 | -4450 | -1833 | -5397 | 2806 |
-| 2015_1 | 51421 | 54343 | 54175 | 54511 | -2922 | -4231 | -1614 | -5277 | 2682 |
-| 2015_2 | 52291 | 54342 | 54174 | 54509 | -2050 | -3359 | -742 | -5174 | 3090 |
-| 2015_3 | 52316 | 54131 | 53963 | 54299 | -1815 | -3124 | -507 | -4948 | 3536 |
-| 2015_4 | 52183 | 53643 | 53475 | 53810 | -1459 | -2768 | -151 | -5034 | 3758 |
-| 2016_1 | 51218 | 52814 | 52646 | 52982 | -1596 | -2905 | -288 | -5626 | 3672 |
+| 2012_2 | 49016 | 50505 | 49732 | 51279 | -1489 | -2797 | -180 | -2966 | 2588 |
+| 2012_3 | 48075 | 50748 | 49974 | 51522 | -2673 | -3982 | -1365 | -4660 | 1344 |
+| 2012_4 | 48290 | 51240 | 50467 | 52014 | -2950 | -4259 | -1642 | -5905 | 1155 |
+| 2013_1 | 49799 | 51698 | 50925 | 52472 | -1899 | -3207 | -590 | -3778 | 2171 |
+| 2013_2 | 49247 | 51835 | 51061 | 52609 | -2588 | -3897 | -1280 | -4825 | 1651 |
+| 2013_3 | 49199 | 52646 | 51873 | 53420 | -3447 | -4755 | -2138 | -5913 | 1018 |
+| 2013_4 | 49969 | 52721 | 51948 | 53495 | -2752 | -4061 | -1444 | -4666 | 2046 |
+| 2014_1 | 49475 | 53314 | 52540 | 54088 | -3839 | -5148 | -2531 | -6054 | 939 |
+| 2014_2 | 50685 | 54607 | 53833 | 55381 | -3923 | -5231 | -2614 | -6207 | 1303 |
+| 2014_3 | 51945 | 55402 | 54628 | 56176 | -3458 | -4766 | -2149 | -5462 | 1474 |
+| 2014_4 | 52526 | 55667 | 54893 | 56441 | -3141 | -4450 | -1833 | -5369 | 1199 |
+| 2015_1 | 51421 | 54343 | 53569 | 55117 | -2922 | -4231 | -1614 | -4919 | 1847 |
+| 2015_2 | 52291 | 54342 | 53568 | 55115 | -2050 | -3359 | -742 | -3834 | 1587 |
+| 2015_3 | 52316 | 54131 | 53357 | 54905 | -1815 | -3124 | -507 | -3263 | 2398 |
+| 2015_4 | 52183 | 53643 | 52869 | 54416 | -1459 | -2768 | -151 | -2797 | 3175 |
+| 2016_1 | 51218 | 52814 | 52040 | 53588 | -1596 | -2905 | -288 | -3193 | 3704 |
 
 As in Model 1, the jackknife prediction intervals here are far too small to be relied on.
 
@@ -631,7 +661,7 @@ bind_rows(
 | model                 | period | cum_att | cum_eff_low | cum_eff_high |
 |:----------------------|:-------|--------:|------------:|-------------:|
 | Model 1: outcome only | 2016_1 |  -38629 |      -49254 |       -26993 |
-| Model 2: + population | 2016_1 |  -42003 |      -72112 |        34306 |
+| Model 2: + population | 2016_1 |  -42003 |      -69075 |        28676 |
 
 ## Notes and limitations
 
